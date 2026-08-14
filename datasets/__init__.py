@@ -1,3 +1,3 @@
 from .detection_dataset import CocoDetectionDataset, detection_collate_fn
+from .instance_segmentation_dataset import COCOInstanceDataset, instance_collate_fn
 from .semantic_segmentation_dataset import SemanticSegmentationDataset
-

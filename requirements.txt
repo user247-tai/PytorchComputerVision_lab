@@ -1,0 +1,7 @@
+numpy
+pillow
+opencv-python
+pycocotools
+torch
+torchvision
+onnxruntime

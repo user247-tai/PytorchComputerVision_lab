@@ -136,7 +136,7 @@ class CocoDetectionDataset(Dataset):
                 canvas_size=tuple(F.get_size(image)),
             ),
             "labels": labels,
-            "image_id": torch.tensor([image_id], dtype=torch.int64),
+            "image_id": image_id,
             "area": area,
             "iscrowd": iscrowd,
             "orig_size": torch.tensor([image_info.get("height", 0), image_info.get("width", 0)], dtype=torch.int64),
