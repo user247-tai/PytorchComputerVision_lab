@@ -134,7 +134,7 @@ def main() -> None:
             num_classes=num_classes,
             criterion=args.criterion,
             output_dim=output_dim,
-            optimizer_name=args.optimizer
+            optimizer_name=args.optimizer,
             pretrained_backbone=False,
         )
 
