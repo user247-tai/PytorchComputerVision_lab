@@ -229,7 +229,7 @@ class Classification(PytorchVisionLab):
 
             eval_metrics = None
             if eval_loader is not None:
-                eval_metrics = self.evaluate_model(eval_loader=eval_loader)
+                eval_metrics = self.evaluate_model(eval_loader=eval_loader, criterion=criterion)
                 self.eval_history.append(eval_metrics)
 
             if checkpoint_path is not None:
