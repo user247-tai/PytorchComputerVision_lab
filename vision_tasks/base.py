@@ -74,10 +74,35 @@ class PytorchVisionLab(ABC):
         return path
 
     @staticmethod
+    def load_model_state_dict(
+        model: torch.nn.Module,
+        path: str | Path,
+        map_location: str | torch.device = "cpu",
+    ) -> torch.nn.Module:
+        state_dict = torch.load(path, map_location=map_location)
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        model.load_state_dict(state_dict)
+        return model
+
+    @staticmethod
     def format_loss_components(loss_components: dict[str, float]) -> str:
         if not loss_components:
             return ""
         return " | ".join(f"{name}={value:.4f}" for name, value in sorted(loss_components.items()))
+
+    @staticmethod
+    def flatten_numeric_metrics(metrics: dict[str, Any], prefix: str = "") -> dict[str, float]:
+        flattened: dict[str, float] = {}
+        for key, value in metrics.items():
+            metric_name = f"{prefix}{key}"
+            if isinstance(value, dict):
+                flattened.update(PytorchVisionLab.flatten_numeric_metrics(value, prefix=f"{metric_name}_"))
+            elif torch.is_tensor(value) and value.numel() == 1:
+                flattened[metric_name] = float(value.detach().cpu().item())
+            elif isinstance(value, (int, float)):
+                flattened[metric_name] = float(value)
+        return flattened
 
     @staticmethod
     def compute_average_precision(recall: torch.Tensor, precision: torch.Tensor) -> float:
@@ -222,3 +247,11 @@ class PytorchVisionLab(ABC):
     @abstractmethod
     def export_onnx(self, *args, **kwargs):
         raise NotImplementedError
+
+    @abstractmethod
+    def optimize_parameters(self, *args, **kwargs):
+        raise NotADirectoryError
+
+    @abstractmethod
+    def trial(self, *args, **kwargs):
+        raise NotADirectoryError
