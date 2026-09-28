@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision.transforms.functional as TF
-from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.models import ResNet18_Weights, resnet18, MobileNet_V3_Large_Weights, mobilenet_v3_large
 from torchvision.transforms.functional import to_pil_image
 from ray import tune
 from ray.air import CheckpointConfig
@@ -41,11 +41,20 @@ class Classification(PytorchVisionLab):
         self.criterion: torch.nn.Module | None = None
 
     def build_model(self, num_classes: int, pretrained_backbone: bool = False, output_dim: int | None = None):
-        weights = ResNet18_Weights.IMAGENET1K_V2 if pretrained_backbone else None
-        model = resnet18(weights=weights)
+        weights = MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained_backbone else None
+        model = mobilenet_v3_large(weights=weights)
         output_dim = output_dim or num_classes
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, output_dim)
+
+        # Replace the actual MobileNet classifier head and keep it trainable.
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Linear(in_features, output_dim)
+
+        if pretrained_backbone:
+            for name, param in model.features.named_parameters():
+                param.requires_grad = False
+            for param in model.classifier.parameters():
+                param.requires_grad = True
+
         self.model = model
         self.num_classes = num_classes
         self.output_dim = output_dim

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms.v2 import Compose, RandomHorizontalFlip, Resize, ToDtype, ToPureTensor
-
+from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
 from datasets import ImageBinaryClassificationDataset, ImageClassificationDataset
 from examples.common import device_from_arg, load_weights_into_model
 from vision_tasks import Classification
