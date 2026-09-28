@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import torch
+from ray import tune
+from ray.air import CheckpointConfig
+from ray.tune import RunConfig, schedulers
+from torch.utils.data import DataLoader
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_320_fpn
 from torchvision.models.mobilenet import MobileNet_V3_Large_Weights
 from torchvision.ops import box_iou
 from torchvision.transforms.functional import to_pil_image
 from torchvision.utils import draw_bounding_boxes
+
+from datasets import detection_collate_fn
 
 from .base import PytorchVisionLab
 
@@ -481,6 +489,203 @@ class Detection(PytorchVisionLab):
             },
         )
         return onnx_path
+
+    def trial(
+        self,
+        config,
+        train_dataset=None,
+        device: str | torch.device | None = None,
+        epochs: int = 10,
+        optimizer_name: str = "sgd",
+        optimizer_kwargs: dict[str, Any] | None = None,
+        eval_dataset=None,
+        num_classes: int = 3,
+        pretrained_backbone: bool = False,
+        initial_weights_path: str | Path | None = None,
+        save_checkpoints: bool = False,
+    ):
+        if train_dataset is None or eval_dataset is None:
+            raise ValueError("Ray Tune requires both train_dataset and eval_dataset for detection.")
+
+        if device is not None:
+            self.device = torch.device(device)
+
+        self.history = []
+        self.eval_history = []
+
+        if self.model is None:
+            self.build_model(num_classes=num_classes, pretrained_backbone=pretrained_backbone)
+        if initial_weights_path is not None:
+            self.load_model_state_dict(self.model, initial_weights_path)
+        self.ensure_model()
+
+        self.optimizer = self.configure_optimizer(
+            lr=config["lr"],
+            weight_decay=config["weight_decay"],
+            optimizer_name=optimizer_name,
+            optimizer_kwargs=optimizer_kwargs,
+        )
+        self.scheduler = self.build_scheduler(self.optimizer, epochs)
+
+        checkpoint = tune.get_checkpoint()
+        if checkpoint is not None:
+            with checkpoint.as_directory() as checkpoint_dir:
+                checkpoint_path = Path(checkpoint_dir) / "checkpoint.pt"
+                checkpoint_state = torch.load(checkpoint_path, map_location=self.device)
+                if isinstance(checkpoint_state, dict):
+                    model_state = checkpoint_state.get("model_state_dict")
+                    optimizer_state = checkpoint_state.get("optimizer_state_dict")
+                else:
+                    model_state, optimizer_state = checkpoint_state
+                if model_state is not None:
+                    self.model.load_state_dict(model_state)
+                if optimizer_state is not None:
+                    self.optimizer.load_state_dict(optimizer_state)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            collate_fn=detection_collate_fn,
+            num_workers=2,
+            pin_memory=torch.cuda.is_available(),
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=detection_collate_fn,
+            num_workers=2,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        for epoch in range(1, epochs + 1):
+            avg_loss, avg_loss_components = self.train_one_epoch(
+                train_loader=train_loader,
+                optimizer=self.optimizer,
+                epoch=epoch,
+            )
+            self.history.append(avg_loss)
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            eval_metrics = self.evaluate_model(eval_loader=eval_loader)
+            self.eval_history.append(eval_metrics)
+
+            report_metrics = {
+                "epoch": epoch,
+                "train_loss": avg_loss,
+            }
+            report_metrics.update(self.flatten_numeric_metrics({"train_loss_components": avg_loss_components}))
+            report_metrics.update(self.flatten_numeric_metrics(eval_metrics))
+
+            if save_checkpoints:
+                with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
+                    checkpoint_path = Path(temp_checkpoint_dir) / "checkpoint.pt"
+                    torch.save(
+                        {
+                            "model_state_dict": self.model.state_dict(),
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "epoch": epoch,
+                        },
+                        checkpoint_path,
+                    )
+                    tune.report(**report_metrics, checkpoint=tune.Checkpoint.from_directory(temp_checkpoint_dir))
+            else:
+                tune.report(**report_metrics)
+
+    def optimize_parameters(
+        self,
+        config,
+        train_dataset=None,
+        device: str | torch.device | None = None,
+        epochs: int = 10,
+        optimizer_name: str = "sgd",
+        optimizer_kwargs: dict[str, Any] | None = None,
+        eval_dataset=None,
+        num_classes: int = 3,
+        pretrained_backbone: bool = False,
+        initial_weights_path: str | Path | None = None,
+        save_checkpoints: bool = False,
+        resume_path: str | Path | None = None,
+        cpus_per_trial: int = 2,
+        gpus_per_trial: int = 1,
+        max_num_epochs: int | None = None,
+        grace_period: int = 1,
+        num_trials: int = 10,
+    ):
+        if eval_dataset is None:
+            raise ValueError("Ray Tune requires eval_dataset for detection.")
+
+        if resume_path is not None and not save_checkpoints:
+            raise ValueError("resume_path requires save_checkpoints=True so resumed trials can continue writing checkpoints.")
+
+        if max_num_epochs is None:
+            max_num_epochs = epochs
+
+        tune_scheduler = schedulers.ASHAScheduler(
+            time_attr="training_iteration",
+            max_t=max_num_epochs,
+            grace_period=grace_period,
+            reduction_factor=2,
+        )
+
+        trainable = tune.with_resources(
+                tune.with_parameters(
+                    self.trial,
+                    train_dataset=train_dataset,
+                    device=device,
+                    optimizer_name=optimizer_name,
+                    optimizer_kwargs=optimizer_kwargs,
+                    eval_dataset=eval_dataset,
+                    num_classes=num_classes,
+                    pretrained_backbone=pretrained_backbone,
+                    initial_weights_path=initial_weights_path,
+                    save_checkpoints=save_checkpoints,
+                    epochs=epochs,
+                ),
+                resources={"cpu": cpus_per_trial, "gpu": gpus_per_trial},
+            )
+        tune_config = tune.TuneConfig(
+                metric="map50_95",
+                mode="max",
+                scheduler=tune_scheduler,
+                num_samples=num_trials,
+            )
+        run_config = RunConfig(
+            storage_path=str(Path.cwd() / "ray_tune") if save_checkpoints else "/tmp/ray_tune",
+            verbose=1,
+            log_to_file=False,
+            checkpoint_config=CheckpointConfig(num_to_keep=1) if save_checkpoints else None,
+        )
+
+        if resume_path is not None:
+            if not tune.Tuner.can_restore(resume_path):
+                raise ValueError(f"Ray Tune cannot restore from '{resume_path}'. Expected an experiment directory containing experiment_state*.json.")
+            tuner = tune.Tuner.restore(
+                str(resume_path),
+                trainable=trainable,
+                resume_unfinished=True,
+                resume_errored=True,
+                param_space=config,
+            )
+        else:
+            tuner = tune.Tuner(
+                trainable,
+                tune_config=tune_config,
+                param_space=config,
+                run_config=run_config,
+            )
+
+        results = tuner.fit()
+        best_result = results.get_best_result("map50_95", "max")
+
+        print(f"Best trial config: {best_result.config}")
+        print(f"Best trial bbox_ap: {best_result.metrics.get('map50_95')}")
+        print(f"Best trial bbox_ap50: {best_result.metrics.get('map50')}")
+        print(f"Best trial loss: {best_result.metrics.get('loss')}")
+        return best_result
 
 
 def _task_from_model(model, device=None):

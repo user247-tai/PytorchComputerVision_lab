@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+from ray import tune
 from torch.utils.data import DataLoader
 from torchvision.transforms.v2 import Compose, RandomHorizontalFlip, ToDtype, ToImage
 
@@ -21,11 +22,12 @@ DEFAULT_WEIGHTS = Path("fire_smoke.pt")
 DEFAULT_ONNX = Path("detection_pt.onnx")
 
 DEFAULT_LABEL_NAMES = {1: "fire", 2: "smoke"}
+DEFAULT_NUM_CLASSES = 2
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Detection task example")
-    parser.add_argument("--mode", choices=["train", "valid", "test", "export", "all"], default="train")
+    parser.add_argument("--mode", choices=["train", "valid", "test", "export", "tune", "all"], default="train")
     parser.add_argument("--device", default=None)
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--train-split", default="train")
@@ -44,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="predictions")
     parser.add_argument("--score-threshold", type=float, default=0.5)
     parser.add_argument("--max-images", type=int, default=12)
+    parser.add_argument("--gpus-per-trial", type=int, default=1, help="GPUs to allocate per Ray Tune trial when multiple CUDA devices are available.")
+    parser.add_argument("--save-checkpoints", action="store_true", help="Save one model/optimizer checkpoint per trial for recovery.")
+    parser.add_argument("--resume-path", default=None, help="Restore a previous Ray Tune experiment directory.")
+    parser.add_argument("--grace-period", type=int, default=1, help="Minimum Tune iterations before ASHA can stop a trial.")
+    parser.add_argument("--num-samples", type=int, default=10, help="Number of Ray Tune trials to run.")
     return parser.parse_args()
 
 
@@ -101,20 +108,24 @@ def build_loaders(args: argparse.Namespace):
         num_workers=2,
         pin_memory=torch.cuda.is_available(),
     )
-    return train_loader, eval_loader, test_loader
+    return train_dataset, eval_dataset, test_dataset, train_loader, eval_loader, test_loader
 
 
 def main() -> None:
     args = parse_args()
     device = device_from_arg(args.device)
+    root = Path(args.root)
+    train_dataset, eval_dataset, test_dataset, train_loader, eval_loader, test_loader = build_loaders(args)
+
     task = Detection(device=device, label_names=DEFAULT_LABEL_NAMES)
-    task.build_model(num_classes=3)
+    if args.mode != "tune":
+        task.build_model(num_classes=DEFAULT_NUM_CLASSES)
 
-    if args.weights:
-        load_weights_into_model(task.model, args.weights)
+        if args.weights:
+            load_weights_into_model(task.model, args.weights)
 
-    train_loader, eval_loader, test_loader = build_loaders(args)
     trained_model_path = Path(args.trained_model_dir) / args.trained_model_name
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     if args.mode in {"train", "all"}:
         task.train_model(
@@ -149,7 +160,38 @@ def main() -> None:
         task.export_onnx(
             onnx_path=args.onnx_path,
             state_dict_path=args.weights if args.weights else None,
-            num_classes=3,
+            num_classes=DEFAULT_NUM_CLASSES,
+        )
+
+    if args.mode == "tune":
+        config = {
+            "lr": tune.loguniform(1e-5, 1e-1),
+            "batch_size": tune.choice([2, 4, 8]),
+            "weight_decay": tune.loguniform(1e-5, 1e-1),
+        }
+        if available_gpus <= 0:
+            gpus_per_trial = 0
+        elif available_gpus == 1:
+            gpus_per_trial = 1
+        else:
+            gpus_per_trial = min(args.gpus_per_trial, available_gpus)
+
+        task.optimize_parameters(
+            config,
+            train_dataset=train_dataset,
+            device=device,
+            epochs=args.epochs,
+            eval_dataset=eval_dataset,
+            num_classes=DEFAULT_NUM_CLASSES,
+            optimizer_name=args.optimizer,
+            initial_weights_path=args.weights or None,
+            save_checkpoints=args.save_checkpoints,
+            resume_path=args.resume_path,
+            grace_period=args.grace_period,
+            cpus_per_trial=2,
+            gpus_per_trial=gpus_per_trial,
+            max_num_epochs=args.epochs,
+            num_trials=args.num_samples,
         )
 
 
