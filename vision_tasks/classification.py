@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Sequence
-
+from functools import partial
 from PIL import Image, ImageDraw, ImageFont
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 import torchvision.transforms.functional as TF
 from torchvision.models import ResNet18_Weights, resnet18
 from torchvision.transforms.functional import to_pil_image
+from ray import tune
+from ray.air import CheckpointConfig
+from ray.tune import RunConfig, schedulers
+import os
+import tempfile
 
 from .base import PytorchVisionLab
 
@@ -436,6 +442,185 @@ class Classification(PytorchVisionLab):
             },
         )
         return onnx_path
+
+    def trial(
+        self,
+        config,
+        train_dataset=None,
+        device: str | torch.device | None = None,
+        epochs: int = 10,
+        optimizer_name: str = "sgd",
+        optimizer_kwargs: dict[str, Any] | None = None,
+        eval_dataset=None,
+        num_classes: int = 2,
+        criterion: torch.nn.Module | str | None = "cross_entropy",
+        output_dim: int | None = None,
+        pretrained_backbone: bool = False,
+        initial_weights_path: str | Path | None = None,
+        save_checkpoints: bool = False,
+    ):
+        if device is not None:
+            self.device = torch.device(device)
+
+        resolved_output_dim = output_dim
+        if resolved_output_dim is None:
+            if isinstance(criterion, str):
+                is_binary_criterion = criterion.lower().strip() in {"bce", "bce_logits"}
+            else:
+                is_binary_criterion = False
+            resolved_output_dim = 1 if is_binary_criterion else num_classes
+
+        self.criterion = self._resolve_criterion(criterion)
+
+        if self.model is None or self.num_classes != num_classes or self.output_dim != resolved_output_dim:
+            self.build_model(
+                num_classes=num_classes,
+                pretrained_backbone=pretrained_backbone,
+                output_dim=resolved_output_dim,
+            )
+        if initial_weights_path is not None:
+            self.load_model_state_dict(self.model, initial_weights_path)
+        self.ensure_model()
+
+        self.optimizer = self.configure_optimizer(
+            lr=config["lr"],
+            weight_decay=config["weight_decay"],
+            optimizer_name=optimizer_name,
+            optimizer_kwargs=optimizer_kwargs,
+        )
+        self.scheduler = self.build_scheduler(self.optimizer, epochs)
+
+        if tune.get_checkpoint():
+            loaded_checkpoint = tune.get_checkpoint()
+            with loaded_checkpoint.as_directory() as loaded_checkpoint_dir:
+                model_state, optimizer_state = torch.load(
+                    os.path.join(loaded_checkpoint_dir, "checkpoint.pt")
+                )
+                self.model.load_state_dict(model_state)
+                self.optimizer.load_state_dict(optimizer_state)
+
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=2)
+        eval_loader = DataLoader(eval_dataset, batch_size=8, shuffle=True, num_workers=2)
+
+        for epoch in range(1, epochs + 1):
+            avg_loss, train_metrics = self.train_one_epoch(
+                train_loader=train_loader,
+                optimizer=self.optimizer,
+                epoch=epoch,
+                criterion=self.criterion,
+            )
+            self.history.append(avg_loss)
+
+            # train_log = self.format_loss_components({"loss": avg_loss, **train_metrics})
+            # print(f"Epoch {epoch} finished | {train_log}")
+
+            eval_metrics = None
+            if eval_loader is not None:
+                eval_metrics = self.evaluate_model(eval_loader=eval_loader, criterion=criterion)
+                if save_checkpoints:
+                    with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
+                        path = os.path.join(temp_checkpoint_dir, "checkpoint.pt")
+                        torch.save(
+                            (self.model.state_dict(), self.optimizer.state_dict()), path
+                        )
+                        checkpoint = tune.Checkpoint.from_directory(temp_checkpoint_dir)
+                        tune.report(eval_metrics, checkpoint=checkpoint)
+                else:
+                    tune.report(eval_metrics)
+                
+            # print("=================")
+
+    def optimize_parameters(
+        self,
+        config,
+        train_dataset=None,
+        device: str | torch.device | None = None,
+        epochs: int = 10,
+        optimizer_name: str = "sgd",
+        optimizer_kwargs: dict[str, Any] | None = None,
+        eval_dataset=None,
+        num_classes: int = 2,
+        criterion: torch.nn.Module | str | None = "cross_entropy",
+        output_dim: int | None = None,
+        pretrained_backbone: bool = False,
+        initial_weights_path: str | Path | None = None,
+        save_checkpoints: bool = False,
+        resume_path: str | Path | None = None,
+        cpus_per_trial: int = 2,
+        gpus_per_trial: int = 1,
+        max_num_epochs: int | None = None,
+        grace_period: int = 1,
+        num_trials: int = 10
+    ):
+        if resume_path is not None and not save_checkpoints:
+            raise ValueError("resume_path requires save_checkpoints=True so resumed trials can continue writing checkpoints.")
+        
+        if max_num_epochs is None:
+            max_num_epochs = epochs
+
+        tune_scheduler = schedulers.ASHAScheduler(
+            time_attr="training_iteration",
+            max_t=max_num_epochs,
+            grace_period=grace_period,
+            reduction_factor=2
+        )
+
+        trainable = tune.with_resources(
+                tune.with_parameters(
+                    self.trial, 
+                    train_dataset=train_dataset,
+                    device=device,
+                    optimizer_name=optimizer_name,
+                    optimizer_kwargs=optimizer_kwargs,
+                    eval_dataset=eval_dataset,
+                    num_classes=num_classes,
+                    criterion=criterion,
+                    output_dim=output_dim,
+                    pretrained_backbone=pretrained_backbone,
+                    initial_weights_path=initial_weights_path,
+                    save_checkpoints=save_checkpoints),
+                resources={"cpu": cpus_per_trial, "gpu": gpus_per_trial}
+            )
+        tune_config = tune.TuneConfig(
+                metric="loss",
+                mode="min",
+                scheduler=tune_scheduler,
+                num_samples=num_trials
+            )
+        run_config = RunConfig(
+            storage_path=str(Path.cwd() / "ray_tune") if save_checkpoints else "/tmp/ray_tune",
+            verbose=1,
+            log_to_file=False,
+            checkpoint_config=CheckpointConfig(num_to_keep=1) if save_checkpoints else None,
+        )
+
+        if resume_path is not None:
+            if not tune.Tuner.can_restore(resume_path):
+                raise ValueError(f"Ray Tune cannot restore from '{resume_path}'. Expected an experiment directory containing experiment_state*.json.")
+            tuner = tune.Tuner.restore(
+                str(resume_path),
+                trainable=trainable,
+                resume_unfinished=True,
+                resume_errored=True,
+                param_space=config,
+            )
+        else:
+            tuner = tune.Tuner(
+                trainable,
+                tune_config=tune_config,
+                param_space=config,
+                run_config=run_config,
+            )
+
+        results = tuner.fit()
+
+        best_result = results.get_best_result("loss", "min")
+
+        print(f"Best trial config: {best_result.config}")
+        print(f"Best trial validation loss: {best_result.metrics['loss']}")
+        print(f"Best trial validation accuracy: {best_result.metrics['accuracy']}")
+        print(f"Best trial validation class accuracy: {best_result.metrics['class_accuracy']}")
+        print(f"Best trial validation num_samples: {best_result.metrics['num_samples']}")
 
 
 def _task_from_model(model, device=None, label_names=None):

@@ -14,6 +14,7 @@ from torchvision.transforms.v2 import Compose, RandomHorizontalFlip, Resize, ToD
 from datasets import ImageBinaryClassificationDataset, ImageClassificationDataset
 from examples.common import device_from_arg, load_weights_into_model
 from vision_tasks import Classification
+from ray import tune
 
 
 DEFAULT_ROOT = Path("data/classification/dataset")
@@ -26,7 +27,7 @@ DEFAULT_CRITERION = "cross_entropy"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Image classification task example")
-    parser.add_argument("--mode", choices=["train", "valid", "test", "export", "all"], default="train")
+    parser.add_argument("--mode", choices=["train", "valid", "test", "export", "tune", "all"], default="train")
     parser.add_argument("--device", default=None)
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--train-split", default="train")
@@ -48,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=0, help="Set 0 to infer classes from train split folders.")
     parser.add_argument("--dataset-type", choices=["multi", "binary"], default="multi")
     parser.add_argument("--criterion", choices=["cross_entropy", "bce", "bce_logits"], default=DEFAULT_CRITERION)
+    parser.add_argument("--gpus-per-trial", type=int, default=1, help="GPUs to allocate per Ray Tune trial when multiple CUDA devices are available.")
+    parser.add_argument("--save-checkpoints", action="store_true", help="Save one model/optimizer checkpoint per trial for recovery.")
+    parser.add_argument("--resume-path", default=None, help="Restore a previous Ray Tune experiment directory.")
+    parser.add_argument("--grace-period", type=int, default=1, help="Minimum Tune iterations before ASHA can stop a trial.")
+    parser.add_argument("--num-samples", type=int, default=10, help="Number of Ray Tune trials to run.")
     return parser.parse_args()
 
 
@@ -112,12 +118,15 @@ def main() -> None:
     args = parse_args()
     device = device_from_arg(args.device)
     train_loader, eval_loader, test_loader, num_classes, label_names = build_loaders(args)
-    task = Classification(device=device, label_names=label_names)
-    output_dim = 1 if args.criterion in {"bce", "bce_logits"} else num_classes
-    task.build_model(num_classes=num_classes, output_dim=output_dim)
 
-    if args.weights:
-        load_weights_into_model(task.model, args.weights)
+    task = Classification(device=device, label_names=label_names)
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    output_dim = 1 if args.criterion in {"bce", "bce_logits"} else num_classes
+    if args.mode != "tune":
+        task.build_model(num_classes=num_classes, pretrained_backbone=True, output_dim=output_dim)
+
+        if args.weights:
+            load_weights_into_model(task.model, args.weights)
 
     trained_model_path = Path(args.trained_model_dir) / args.trained_model_name
 
@@ -163,6 +172,49 @@ def main() -> None:
             num_classes=num_classes,
         )
 
+    if args.mode in {"tune"}:
+        config = {
+            "lr": tune.loguniform(1e-5, 1e-1), 
+            "batch_size": tune.choice([8, 16, 32]),
+            "weight_decay": tune.loguniform(1e-5, 1e-1),
+        }
+        root = Path(args.root)
+        train_dataset, eval_dataset, _ = build_datasets(
+            root,
+            args.train_split,
+            args.eval_split,
+            args.test_split,
+            args.input_size,
+            args.dataset_type,
+        )
+
+        if available_gpus <= 0:
+            gpus_per_trial = 0
+        elif available_gpus == 1:
+            gpus_per_trial = 1
+        else:
+            gpus_per_trial = min(args.gpus_per_trial, available_gpus)
+
+        task.optimize_parameters(
+            config,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            device=device,
+            epochs=args.epochs,
+            num_classes=num_classes,
+            criterion=args.criterion,
+            output_dim=output_dim,
+            optimizer_name=args.optimizer,
+            pretrained_backbone=True,
+            initial_weights_path=args.weights or None,
+            save_checkpoints=args.save_checkpoints,
+            resume_path=args.resume_path,
+            grace_period=args.grace_period,
+            cpus_per_trial=2,
+            gpus_per_trial=gpus_per_trial,
+            max_num_epochs=args.epochs,
+            num_trials=args.num_samples
+        )
 
 if __name__ == "__main__":
     main()
